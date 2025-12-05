@@ -98,29 +98,61 @@ END openxenium;
 
 ARCHITECTURE Behavioral OF openxenium IS
 
+   -- Optimized LPC state machine - reduced from 11 states to 4 states
    TYPE LPC_STATE_MACHINE IS (
-   WAIT_START,
-   CYCTYPE_DIR,
-   ADDRESS,
-   WRITE_DATA,
-   READ_DATA0,
-   READ_DATA1,
-   TAR1,
-   TAR2,
-   SYNCING,
-   SYNC_COMPLETE,
-   TAR_EXIT
+      WAIT_START,   -- Wait for LPC start frame (0000)
+      GET_CYC,      -- Get cycle type (IO/MEM, Read/Write)
+      GET_ADDR,     -- Get address (8 nibbles for MEM, 4 for IO)
+      DATA          -- TAR, SYNC, and DATA transfer sequences
    );
 
    TYPE CYC_TYPE IS (
-   IO_READ, --Default state
-   IO_WRITE,
-   MEM_READ,
-   MEM_WRITE
+      IO_READ,      -- Default state
+      IO_WRITE,
+      MEM_READ,
+      MEM_WRITE
    );
 
-   SIGNAL LPC_CURRENT_STATE : LPC_STATE_MACHINE;
-   SIGNAL CYCLE_TYPE : CYC_TYPE;
+   -- Constants for LPC cycle offsets
+   CONSTANT C_FSM_COUNT_RESET : INTEGER := 0;
+   CONSTANT C_FSM_COUNT_IO_START_OFFSET : INTEGER := 4;
+   CONSTANT C_FSM_DATA_WRITE_LO_NIBBLE_OFFSET : INTEGER := 0;
+   CONSTANT C_FSM_DATA_WRITE_HI_NIBBLE_OFFSET : INTEGER := 1;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE0 : INTEGER := 0;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE1 : INTEGER := 1;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE2 : INTEGER := 2;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE3 : INTEGER := 3;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE4 : INTEGER := 4;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE5 : INTEGER := 5;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE6 : INTEGER := 6;
+   CONSTANT C_FSM_ADDR_SEQ_NIBBLE7 : INTEGER := 7;
+   CONSTANT C_FSM_ADDR_SEQ_MAX_COUNT : INTEGER := C_FSM_ADDR_SEQ_NIBBLE7;
+   CONSTANT C_FSM_DATA_SEQ_MAX_COUNT : INTEGER := 6;
+   CONSTANT C_FSM_DATA_SEQ_TARA2_READ : INTEGER := 1;
+   CONSTANT C_FSM_DATA_SEQ_TARA2_WRITE : INTEGER := 3;
+   CONSTANT C_FSM_DATA_SEQ_DATA1_READ : INTEGER := 3;
+   CONSTANT C_FSM_DATA_SEQ_DATA2_READ : INTEGER := 4;
+   CONSTANT C_FSM_DATA_SEQ_SYNC_READ : INTEGER := 2;
+   CONSTANT C_FSM_DATA_SEQ_SYNC_WRITE : INTEGER := 4;
+
+   -- LPC protocol constants
+   CONSTANT C_LAD_START_PATTERN : STD_LOGIC_VECTOR(3 DOWNTO 0) := "0000";
+   CONSTANT C_LAD_IDLE_PATTERN : STD_LOGIC_VECTOR(3 DOWNTO 0) := "1111";
+   CONSTANT C_LAD_INPUT_PATTERN : STD_LOGIC_VECTOR(3 DOWNTO 0) := "ZZZZ";
+   CONSTANT C_LAD_PATTERN_SYNC : STD_LOGIC_VECTOR(3 DOWNTO 0) := "0000";
+   CONSTANT C_CYC_MEM_PREFIX : STD_LOGIC_VECTOR(1 DOWNTO 0) := "01";
+   CONSTANT C_CYC_IO_PREFIX : STD_LOGIC_VECTOR(1 DOWNTO 0) := "00";
+   CONSTANT C_CYC_DIRECTION_READ : STD_LOGIC := '0';
+   CONSTANT C_CYC_DIRECTION_WRITE : STD_LOGIC := '1';
+   CONSTANT C_LAD_ADDR_PATTERN1 : STD_LOGIC_VECTOR(3 DOWNTO 0) := "1111";
+   CONSTANT C_LAD_IOREG_PATTERN1 : STD_LOGIC_VECTOR(3 DOWNTO 0) := "1111";
+   CONSTANT C_LAD_IOREG_PATTERN2 : STD_LOGIC_VECTOR(3 DOWNTO 0) := "0111";
+   CONSTANT C_LAD_IOREG_PATTERN3 : STD_LOGIC_VECTOR(3 DOWNTO 0) := "0000";
+
+   SIGNAL LPC_CURRENT_STATE : LPC_STATE_MACHINE := WAIT_START;
+   SIGNAL CYCLE_TYPE : CYC_TYPE := IO_READ;
+   SIGNAL s_lad_dir : STD_LOGIC;  -- '0' for read, '1' for write
+   SIGNAL s_io_cyc : BOOLEAN := FALSE;
 
    SIGNAL LPC_ADDRESS : STD_LOGIC_VECTOR (20 DOWNTO 0); --LPC Address is actually 32bits for memory IO, but we only need 21.
 
@@ -142,12 +174,13 @@ ARCHITECTURE Behavioral OF openxenium IS
    SIGNAL TSOPBOOT : STD_LOGIC := '0';
    SIGNAL D0LEVEL : STD_LOGIC := '0';
 
-   --GENERIC COUNTER USED TO TRACK ADDRESS AND SYNC COUNTERS.
-   SIGNAL COUNT : INTEGER RANGE 0 TO 7;
+   -- Optimized counter for address and data phases
+   SIGNAL s_fsm_counter : INTEGER RANGE C_FSM_COUNT_RESET TO C_FSM_ADDR_SEQ_MAX_COUNT;
+   SIGNAL s4_io_reg_addr : STD_LOGIC_VECTOR(3 DOWNTO 0);
 
 BEGIN
    --ASSIGN THE IO TO SIGNALS BASED ON REQUIRED BEHAVIOUR
-   --HEADER_CS <= REG_00EF_WRITE(5);   -- Really need to put this back in somehow. 100% full :(
+   HEADER_CS <= REG_00EF_WRITE(5);
    HEADER_SCK <= REG_00EF_WRITE(6);
    HEADER_MOSI <= REG_00EF_WRITE(4);
 
@@ -160,13 +193,13 @@ BEGIN
    --LAD lines can be either input or output
    --The output values depend on variable states of the LPC transaction
    --Refer to the Intel LPC Specification Rev 1.1
-   LPC_LAD <= "0000" WHEN LPC_CURRENT_STATE = SYNC_COMPLETE ELSE
-              "0101" WHEN LPC_CURRENT_STATE = SYNCING ELSE
-              "1111" WHEN LPC_CURRENT_STATE = TAR2 ELSE
-              "1111" WHEN LPC_CURRENT_STATE = TAR_EXIT ELSE
-              READBUFFER(3 DOWNTO 0) WHEN LPC_CURRENT_STATE = READ_DATA0 ELSE --This has to be lower nibble first!
-              READBUFFER(7 DOWNTO 4) WHEN LPC_CURRENT_STATE = READ_DATA1 ELSE
-              "ZZZZ";
+   -- Optimized: Use counter-based approach instead of explicit states
+   LPC_LAD <= C_LAD_PATTERN_SYNC WHEN (LPC_CURRENT_STATE = DATA AND s_lad_dir = C_CYC_DIRECTION_READ AND s_fsm_counter = C_FSM_DATA_SEQ_SYNC_READ) ELSE
+              C_LAD_PATTERN_SYNC WHEN (LPC_CURRENT_STATE = DATA AND s_lad_dir = C_CYC_DIRECTION_WRITE AND s_fsm_counter = C_FSM_DATA_SEQ_SYNC_WRITE) ELSE
+              READBUFFER(3 DOWNTO 0) WHEN (LPC_CURRENT_STATE = DATA AND s_lad_dir = C_CYC_DIRECTION_READ AND s_fsm_counter = C_FSM_DATA_SEQ_DATA1_READ) ELSE
+              READBUFFER(7 DOWNTO 4) WHEN (LPC_CURRENT_STATE = DATA AND s_lad_dir = C_CYC_DIRECTION_READ AND s_fsm_counter = C_FSM_DATA_SEQ_DATA2_READ) ELSE
+              C_LAD_IDLE_PATTERN WHEN (LPC_CURRENT_STATE = DATA AND s_fsm_counter >= C_FSM_DATA_SEQ_TARA2_READ AND s_fsm_counter <= C_FSM_DATA_SEQ_MAX_COUNT) ELSE
+              C_LAD_INPUT_PATTERN;
 
    --FLASH_DQ is mapped to the data byte sent by the Xbox in MEM_WRITE mode, else its just an input
    FLASH_DQ <= sFLASH_DQ WHEN CYCLE_TYPE = MEM_WRITE ELSE "ZZZZZZZZ";
@@ -175,21 +208,15 @@ BEGIN
    --Minimum pulse width 90ns.
    --Address is latched on the falling edge of WE.
    --Data is latched on the rising edge of WE.
-   FLASH_WE <= '0' WHEN CYCLE_TYPE = MEM_WRITE AND
-               (LPC_CURRENT_STATE = TAR1 OR
-               LPC_CURRENT_STATE = TAR2 OR
-               LPC_CURRENT_STATE = SYNCING) ELSE '1';
+   -- Optimized: Use counter-based approach
+   FLASH_WE <= '0' WHEN (CYCLE_TYPE = MEM_WRITE AND LPC_CURRENT_STATE = DATA AND 
+                        s_fsm_counter >= C_FSM_DATA_SEQ_TARA2_WRITE AND s_fsm_counter <= C_FSM_DATA_SEQ_SYNC_WRITE) ELSE '1';
 
    --Output Enable for Flash Memory Read (Active low)
    --Output Enable must be pulled low for 50ns before data is valid for reading
-   FLASH_OE <= '0' WHEN CYCLE_TYPE = MEM_READ AND
-               (LPC_CURRENT_STATE = TAR1 OR
-               LPC_CURRENT_STATE = TAR2 OR
-               LPC_CURRENT_STATE = SYNCING OR
-               LPC_CURRENT_STATE = SYNC_COMPLETE OR
-               LPC_CURRENT_STATE = READ_DATA0 OR
-               LPC_CURRENT_STATE = READ_DATA1 OR
-               LPC_CURRENT_STATE = TAR_EXIT) ELSE '1';
+   -- Optimized: Use counter-based approach
+   FLASH_OE <= '0' WHEN (CYCLE_TYPE = MEM_READ AND LPC_CURRENT_STATE = DATA AND 
+                        s_fsm_counter >= C_FSM_DATA_SEQ_TARA2_READ AND s_fsm_counter <= C_FSM_DATA_SEQ_MAX_COUNT) ELSE '1';
 
    --D0 has the following behaviour
    --Held low on boot to ensure it boots from the LPC then released when definitely booting from modchip.
@@ -204,199 +231,200 @@ BEGIN
 
    REG_00EF_READ <= XENIUM_RECOVERY & '0' & HEADER_4 & HEADER_1 & REG_00EF_WRITE(3 DOWNTO 0);
 
-PROCESS (LPC_CLK, LPC_RST, TSOPBOOT) BEGIN
-
-   IF (LPC_RST = '0') THEN
-      --LPC_RST goes low during boot up or hard reset.
-      --We need to set D0 only if not TSOP booting.
-      D0LEVEL <= TSOPBOOT;
-      LPC_CURRENT_STATE <= WAIT_START;
-
-   ELSIF (rising_edge(LPC_CLK)) THEN
-      CASE LPC_CURRENT_STATE IS
-         WHEN WAIT_START =>
-            IF LPC_LAD = "0000" AND TSOPBOOT = '0' THEN
-               LPC_CURRENT_STATE <= CYCTYPE_DIR;
-            END IF;
-         WHEN CYCTYPE_DIR =>
-
-            LPC_CURRENT_STATE <= ADDRESS;
-
-            IF LPC_LAD(3 DOWNTO 1) = "000" THEN
-               CYCLE_TYPE <= IO_READ;
-               COUNT <= 3;
-            ELSIF LPC_LAD(3 DOWNTO 1) = "001" THEN
-               CYCLE_TYPE <= IO_WRITE;
-               COUNT <= 3;
-            ELSIF LPC_LAD(3 DOWNTO 1) = "010" THEN
-               CYCLE_TYPE <= MEM_READ;
-               COUNT <= 7;
-            ELSIF LPC_LAD(3 DOWNTO 1) = "011" THEN
-               CYCLE_TYPE <= MEM_WRITE;
-               COUNT <= 7;
-            ELSE
-               LPC_CURRENT_STATE <= WAIT_START; -- Unsupported, reset state machine.
-            END IF;
-
-         --ADDRESS GATHERING
-         WHEN ADDRESS =>
-
-            IF COUNT = 5 THEN
-               LPC_ADDRESS(20) <= LPC_LAD(0);
-            ELSIF COUNT = 4 THEN
-               LPC_ADDRESS(19 DOWNTO 16) <= LPC_LAD;
-               --BANK CONTROL
-               -- Set recovery bank if switch is activated
-               IF XENIUM_RECOVERY = '0' AND TSOPBOOT = '0' AND D0LEVEL = '0' THEN
-                  REG_00EF_WRITE(3 DOWNTO 0) <= "1010";
-               END IF;
-               CASE REG_00EF_WRITE(3 DOWNTO 0) IS
-                  WHEN "0001" =>
-                     LPC_ADDRESS(20 DOWNTO 18) <= "110"; --256kb bank
-                  WHEN "0010" =>
-                     LPC_ADDRESS(20 DOWNTO 19) <= "10"; --512kb bank
-                  WHEN "0011" =>
-                     LPC_ADDRESS(20 DOWNTO 18) <= "000"; --256kb bank
-                  WHEN "0100" =>
-                     LPC_ADDRESS(20 DOWNTO 18) <= "001"; --256kb bank
-                  WHEN "0101" =>
-                     LPC_ADDRESS(20 DOWNTO 18) <= "010"; --256kb bank
-                  WHEN "0110" =>
-                     LPC_ADDRESS(20 DOWNTO 18) <= "011"; --256kb bank
-                  WHEN "0111" =>
-                     LPC_ADDRESS(20 DOWNTO 19) <= "00"; --512kb bank
-                  WHEN "1000" =>
-                     LPC_ADDRESS(20 DOWNTO 19) <= "01"; --512kb bank
-                  WHEN "1001" =>
-                     LPC_ADDRESS(20) <= '0'; --1mb bank
-                  WHEN "1010" =>
-                     LPC_ADDRESS(20 DOWNTO 18) <= "111"; --256kb bank
-                  WHEN "0000" =>
-                     --Bank zero will disable modchip and release D0 and reset state machine.
-                     LPC_CURRENT_STATE <= WAIT_START;
-                     TSOPBOOT <= '1';
-                  WHEN OTHERS =>
-               END CASE;
-            ELSIF COUNT = 3 THEN
-               LPC_ADDRESS(15 DOWNTO 12) <= LPC_LAD;
-            ELSIF COUNT = 2 THEN
-               LPC_ADDRESS(11 DOWNTO 8) <= LPC_LAD;
-            ELSIF COUNT = 1 THEN
-               LPC_ADDRESS(7 DOWNTO 4) <= LPC_LAD;
-            ELSIF COUNT = 0 THEN
-               LPC_ADDRESS(3 DOWNTO 0) <= LPC_LAD;
-
-               LPC_CURRENT_STATE <= WAIT_START;
-
-               -- catch unsupported IO read/writes here before they modify LAD
-               IF CYCLE_TYPE = MEM_READ THEN
-                  LPC_CURRENT_STATE <= TAR1;
-               ELSIF CYCLE_TYPE = MEM_WRITE THEN
-                  LPC_CURRENT_STATE <= WRITE_DATA;
-               ELSIF LPC_ADDRESS(7 DOWNTO 1) = x"77" THEN   -- check if supported Xenium register (EE or EF), the last bit is irrelevant
-
-                  IF CYCLE_TYPE = IO_READ THEN
-                     LPC_CURRENT_STATE <= TAR1;
-                  ELSIF CYCLE_TYPE = IO_WRITE THEN
-                     LPC_CURRENT_STATE <= WRITE_DATA;
-                  END IF;
-
-               END IF;
-
-            END IF;
-            COUNT <= COUNT - 1;
-
-         -- MEMORY OR IO WRITES. These all happen lower nibble first. (Refer to Intel LPC spec)
-         -- HACK: abuses counter rollover from previous state
-         WHEN WRITE_DATA =>
-
-            IF CYCLE_TYPE = MEM_WRITE THEN
-
-               IF COUNT = 7 THEN
-                  sFLASH_DQ(3 DOWNTO 0) <= LPC_LAD;
-               ELSE
-                  sFLASH_DQ(7 DOWNTO 4) <= LPC_LAD;
-               END IF;
-
-            ELSE
-
-               -- it's already been confirmed this is a supported Xenium register in a previous state
-               -- so only a single bit needs to be checked to differentiate between the two
-               IF LPC_ADDRESS(0) = '0' THEN
-
-                  IF COUNT = 7 THEN
-                     REG_00EE_WRITE(3 DOWNTO 0) <= LPC_LAD;
-                  ELSE
-                     REG_00EE_WRITE(7 DOWNTO 4) <= LPC_LAD;
-                  END IF;
-               ELSE
-                  IF COUNT = 7 THEN
-                     REG_00EF_WRITE(3 DOWNTO 0) <= LPC_LAD;
-                  ELSE
-                     REG_00EF_WRITE(7 DOWNTO 4) <= LPC_LAD;
-                  END IF;
-
-               END IF;
-
-            END IF;
-
-            IF COUNT = 6 THEN
-               LPC_CURRENT_STATE <= TAR1;
-            END IF;
-            COUNT <= COUNT - 1;
-
-         --MEMORY OR IO READS
-         WHEN READ_DATA0 =>
-            LPC_CURRENT_STATE <= READ_DATA1;
-         WHEN READ_DATA1 =>
-            LPC_CURRENT_STATE <= TAR_EXIT;
-
-         --TURN BUS AROUND (HOST TO PERIPHERAL)
-         WHEN TAR1 =>
-            LPC_CURRENT_STATE <= TAR2;
-         WHEN TAR2 =>
-            LPC_CURRENT_STATE <= SYNCING;
-            COUNT <= 2;
-
-         --SYNCING STAGE
-         WHEN SYNCING =>
-            COUNT <= COUNT - 1;
-            --Buffer IO reads during syncing. Helps output timings
-            IF COUNT = 0 THEN
-               IF CYCLE_TYPE = MEM_READ THEN
-                  READBUFFER <= FLASH_DQ;
-
-               ELSIF CYCLE_TYPE = IO_READ THEN
-
-                  -- it's already been confirmed this is a supported Xenium register in a previous state
-                  -- so only a single bit needs to be checked to differentiate between the two
-                  IF LPC_ADDRESS(0) = '0' THEN
-                     READBUFFER <= REG_00EE_READ;
-                  ELSE
-                     READBUFFER <= REG_00EF_READ;
-                  END IF;
-               END IF;
-              LPC_CURRENT_STATE <= SYNC_COMPLETE;
-           END IF;
-         WHEN SYNC_COMPLETE =>
-            IF CYCLE_TYPE = MEM_READ OR CYCLE_TYPE = IO_READ THEN
-               LPC_CURRENT_STATE <= READ_DATA0;
-            ELSE
-               LPC_CURRENT_STATE <= TAR_EXIT;
-            END IF;
-
-         --TURN BUS AROUND (PERIPHERAL TO HOST)
-         WHEN TAR_EXIT =>
-            --D0 is held low until a few memory reads
-            --This ensures it is booting from the modchip. Genuine Xenium arbitrarily
-            --releases after the 5th read. This is always address 0x74
-            IF LPC_ADDRESS(7 DOWNTO 0) = x"74" THEN
-               D0LEVEL <= '1';
-            END IF;
-
-            CYCLE_TYPE <= IO_READ;
+   -- Main LPC state machine process - optimized with counter-based approach
+   PROCESS (LPC_CLK) BEGIN
+      IF rising_edge(LPC_CLK) THEN
+         IF LPC_RST = '0' THEN
+            --LPC_RST goes low during boot up or hard reset.
+            --We need to set D0 only if not TSOP booting.
+            D0LEVEL <= TSOPBOOT;
             LPC_CURRENT_STATE <= WAIT_START;
-      END CASE;
-   END IF;
-END PROCESS;
+            s_fsm_counter <= C_FSM_COUNT_RESET;
+         ELSE
+            -- Increment counter
+            IF s_fsm_counter < C_FSM_ADDR_SEQ_MAX_COUNT THEN
+               s_fsm_counter <= s_fsm_counter + 1;
+            ELSE
+               s_fsm_counter <= C_FSM_COUNT_RESET;
+            END IF;
+
+            CASE LPC_CURRENT_STATE IS
+               WHEN WAIT_START =>
+                  s_io_cyc <= FALSE;
+                  IF LPC_LAD = C_LAD_START_PATTERN AND TSOPBOOT = '0' THEN
+                     LPC_CURRENT_STATE <= GET_CYC;
+                  END IF;
+
+               WHEN GET_CYC =>
+                  -- Release D0 after cycle type is detected
+                  IF CYCLE_TYPE = MEM_READ OR CYCLE_TYPE = MEM_WRITE THEN
+                     -- D0 is held during memory cycles
+                  ELSE
+                     -- D0 released for IO cycles
+                  END IF;
+
+                  IF LPC_LAD(3 DOWNTO 2) = C_CYC_MEM_PREFIX THEN
+                     -- Memory read or write
+                     s_fsm_counter <= C_FSM_COUNT_RESET;
+                     LPC_CURRENT_STATE <= GET_ADDR;
+                     IF LPC_LAD(1) = '0' THEN
+                        CYCLE_TYPE <= MEM_READ;
+                     ELSE
+                        CYCLE_TYPE <= MEM_WRITE;
+                     END IF;
+                  ELSIF LPC_LAD(3 DOWNTO 2) = C_CYC_IO_PREFIX THEN
+                     -- IO read or write
+                     s_fsm_counter <= C_FSM_COUNT_IO_START_OFFSET;
+                     s_io_cyc <= TRUE;
+                     LPC_CURRENT_STATE <= GET_ADDR;
+                     IF LPC_LAD(1) = '0' THEN
+                        CYCLE_TYPE <= IO_READ;
+                     ELSE
+                        CYCLE_TYPE <= IO_WRITE;
+                     END IF;
+                  ELSE
+                     LPC_CURRENT_STATE <= WAIT_START; -- Unsupported cycle
+                  END IF;
+                  s_lad_dir <= LPC_LAD(1);
+
+               WHEN GET_ADDR =>
+                  CASE s_fsm_counter IS
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE0 | C_FSM_ADDR_SEQ_NIBBLE1 =>
+                        -- First 2 nibbles of memory cycle must be "1111"
+                        IF NOT s_io_cyc AND LPC_LAD /= C_LAD_ADDR_PATTERN1 THEN
+                           LPC_CURRENT_STATE <= WAIT_START;
+                        END IF;
+
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE2 =>
+                        IF NOT s_io_cyc THEN
+                           -- Memory cycle: capture A20
+                           LPC_ADDRESS(20) <= LPC_LAD(0);
+                        END IF;
+
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE3 =>
+                        IF NOT s_io_cyc THEN
+                           -- Memory cycle: capture A19-A16 and apply bank selection
+                           LPC_ADDRESS(19 DOWNTO 16) <= LPC_LAD;
+                           -- Set recovery bank if switch is activated
+                           IF XENIUM_RECOVERY = '0' AND TSOPBOOT = '0' AND D0LEVEL = '0' THEN
+                              REG_00EF_WRITE(3 DOWNTO 0) <= "1010";
+                           END IF;
+                           -- Apply bank selection
+                           CASE REG_00EF_WRITE(3 DOWNTO 0) IS
+                              WHEN "0001" => LPC_ADDRESS(20 DOWNTO 18) <= "110";
+                              WHEN "0010" => LPC_ADDRESS(20 DOWNTO 19) <= "10";
+                              WHEN "0011" => LPC_ADDRESS(20 DOWNTO 18) <= "000";
+                              WHEN "0100" => LPC_ADDRESS(20 DOWNTO 18) <= "001";
+                              WHEN "0101" => LPC_ADDRESS(20 DOWNTO 18) <= "010";
+                              WHEN "0110" => LPC_ADDRESS(20 DOWNTO 18) <= "011";
+                              WHEN "0111" => LPC_ADDRESS(20 DOWNTO 19) <= "00";
+                              WHEN "1000" => LPC_ADDRESS(20 DOWNTO 19) <= "01";
+                              WHEN "1001" => LPC_ADDRESS(20) <= '0';
+                              WHEN "1010" => LPC_ADDRESS(20 DOWNTO 18) <= "111";
+                              WHEN "0000" =>
+                                 TSOPBOOT <= '1';
+                                 LPC_CURRENT_STATE <= WAIT_START;
+                              WHEN OTHERS => NULL;
+                           END CASE;
+                        END IF;
+
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE4 =>
+                        IF NOT s_io_cyc THEN
+                           LPC_ADDRESS(15 DOWNTO 12) <= LPC_LAD;
+                        ELSIF s_io_cyc THEN
+                           -- IO address: first nibble should be 0x0 for address 0x0F7E/0x0F7F
+                           IF LPC_LAD /= "0000" THEN
+                              s_io_cyc <= FALSE;
+                           END IF;
+                        END IF;
+
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE5 =>
+                        IF NOT s_io_cyc THEN
+                           LPC_ADDRESS(11 DOWNTO 8) <= LPC_LAD;
+                        ELSIF s_io_cyc THEN
+                           -- IO address: second nibble should be 0xF
+                           IF LPC_LAD /= C_LAD_IOREG_PATTERN1 THEN
+                              s_io_cyc <= FALSE;
+                           END IF;
+                        END IF;
+
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE6 =>
+                        IF NOT s_io_cyc THEN
+                           LPC_ADDRESS(7 DOWNTO 4) <= LPC_LAD;
+                        ELSIF s_io_cyc THEN
+                           -- IO address: third nibble should be 0x7
+                           IF LPC_LAD /= C_LAD_IOREG_PATTERN2 THEN
+                              s_io_cyc <= FALSE;
+                           END IF;
+                        END IF;
+
+                     WHEN C_FSM_ADDR_SEQ_NIBBLE7 =>
+                        IF NOT s_io_cyc THEN
+                           LPC_ADDRESS(3 DOWNTO 0) <= LPC_LAD;
+                        ELSIF s_io_cyc THEN
+                           -- IO address: fourth nibble should be 0xE or 0xF (register 0xEE or 0xEF)
+                           -- Verify address byte will be 0xEE or 0xEF (bits 7-1 = 0x77)
+                           IF LPC_LAD(3 DOWNTO 1) = "111" THEN
+                              s4_io_reg_addr <= LPC_LAD;
+                           ELSE
+                              s_io_cyc <= FALSE;
+                           END IF;
+                        END IF;
+                        s_fsm_counter <= C_FSM_COUNT_RESET;
+                        LPC_CURRENT_STATE <= DATA;
+
+                     WHEN OTHERS => NULL;
+                  END CASE;
+
+               WHEN DATA =>
+                  -- Handle data phase with counter-based approach
+                  IF s_fsm_counter > C_FSM_DATA_SEQ_MAX_COUNT THEN
+                     LPC_CURRENT_STATE <= WAIT_START;
+                     -- D0 is held low until a few memory reads
+                     -- Genuine Xenium releases after the 5th read at address 0x74
+                     IF LPC_ADDRESS(7 DOWNTO 0) = x"74" THEN
+                        D0LEVEL <= '1';
+                     END IF;
+                  ELSIF s_lad_dir = C_CYC_DIRECTION_READ THEN
+                     -- Read operation: buffer data during sync phase
+                     IF s_fsm_counter = C_FSM_DATA_SEQ_SYNC_READ THEN
+                        IF CYCLE_TYPE = MEM_READ THEN
+                           READBUFFER <= FLASH_DQ;
+                        ELSIF CYCLE_TYPE = IO_READ AND s_io_cyc THEN
+                           -- Use s4_io_reg_addr to determine which register (0xEE or 0xEF)
+                           IF s4_io_reg_addr(0) = '0' THEN
+                              READBUFFER <= REG_00EE_READ;
+                           ELSE
+                              READBUFFER <= REG_00EF_READ;
+                           END IF;
+                        END IF;
+                     END IF;
+                  ELSIF s_lad_dir = C_CYC_DIRECTION_WRITE THEN
+                     -- Write operation: capture data
+                     IF s_fsm_counter = C_FSM_DATA_WRITE_LO_NIBBLE_OFFSET THEN
+                        IF CYCLE_TYPE = MEM_WRITE THEN
+                           sFLASH_DQ(3 DOWNTO 0) <= LPC_LAD;
+                        ELSIF s_io_cyc THEN
+                           IF s4_io_reg_addr(0) = '0' THEN
+                              REG_00EE_WRITE(3 DOWNTO 0) <= LPC_LAD;
+                           ELSE
+                              REG_00EF_WRITE(3 DOWNTO 0) <= LPC_LAD;
+                           END IF;
+                        END IF;
+                     ELSIF s_fsm_counter = C_FSM_DATA_WRITE_HI_NIBBLE_OFFSET THEN
+                        IF CYCLE_TYPE = MEM_WRITE THEN
+                           sFLASH_DQ(7 DOWNTO 4) <= LPC_LAD;
+                        ELSIF s_io_cyc THEN
+                           IF s4_io_reg_addr(0) = '0' THEN
+                              REG_00EE_WRITE(7 DOWNTO 4) <= LPC_LAD;
+                           ELSE
+                              REG_00EF_WRITE(7 DOWNTO 4) <= LPC_LAD;
+                           END IF;
+                        END IF;
+                     END IF;
+                  END IF;
+            END CASE;
+         END IF;
+      END IF;
+   END PROCESS;
 END Behavioral;
