@@ -332,7 +332,7 @@ BEGIN
                         IF NOT s_io_cyc THEN
                            LPC_ADDRESS(15 DOWNTO 12) <= LPC_LAD;
                         ELSIF s_io_cyc THEN
-                           -- IO address: first nibble should be 0x0 for address 0x0F7E/0x0F7F
+                           -- IO address: first nibble should be 0x0 for address 0x00EE/0x00EF
                            IF LPC_LAD /= "0000" THEN
                               s_io_cyc <= FALSE;
                            END IF;
@@ -342,8 +342,8 @@ BEGIN
                         IF NOT s_io_cyc THEN
                            LPC_ADDRESS(11 DOWNTO 8) <= LPC_LAD;
                         ELSIF s_io_cyc THEN
-                           -- IO address: second nibble should be 0xF
-                           IF LPC_LAD /= C_LAD_IOREG_PATTERN1 THEN
+                           -- IO address: second nibble should be 0x0
+                           IF LPC_LAD /= "0000" THEN
                               s_io_cyc <= FALSE;
                            END IF;
                         END IF;
@@ -352,8 +352,8 @@ BEGIN
                         IF NOT s_io_cyc THEN
                            LPC_ADDRESS(7 DOWNTO 4) <= LPC_LAD;
                         ELSIF s_io_cyc THEN
-                           -- IO address: third nibble should be 0x7
-                           IF LPC_LAD /= C_LAD_IOREG_PATTERN2 THEN
+                           -- IO address: third nibble should be 0xE (register 0xEE or 0xEF)
+                           IF LPC_LAD /= "1110" THEN
                               s_io_cyc <= FALSE;
                            END IF;
                         END IF;
@@ -363,7 +363,7 @@ BEGIN
                            LPC_ADDRESS(3 DOWNTO 0) <= LPC_LAD;
                         ELSIF s_io_cyc THEN
                            -- IO address: fourth nibble should be 0xE or 0xF (register 0xEE or 0xEF)
-                           -- Verify address byte will be 0xEE or 0xEF (bits 7-1 = 0x77)
+                           -- Verify address byte will be 0xEE or 0xEF
                            IF LPC_LAD(3 DOWNTO 1) = "111" THEN
                               s4_io_reg_addr <= LPC_LAD;
                            ELSE
